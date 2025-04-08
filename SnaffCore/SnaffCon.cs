@@ -17,6 +17,8 @@ using static SnaffCore.Config.Options;
 using Timer = System.Timers.Timer;
 using System.Net;
 using System.Runtime.InteropServices;
+using System.IO;
+using Nett;
 
 namespace SnaffCore
 {
@@ -26,10 +28,10 @@ namespace SnaffCore
 
         private BlockingMq Mq { get; set; }
 
-        private static BlockingStaticTaskScheduler ShareTaskScheduler;
-        private static BlockingStaticTaskScheduler TreeTaskScheduler;
-        private static BlockingStaticTaskScheduler FileTaskScheduler;
-        
+        private static ShareTaskScheduler ShareTaskScheduler;
+        private static TreeTaskScheduler TreeTaskScheduler;
+        private static FileTaskScheduler FileTaskScheduler;
+
         private static ShareFinder ShareFinder;
         private static TreeWalker TreeWalker;
         private static FileScanner FileScanner;
@@ -47,10 +49,10 @@ namespace SnaffCore
             int treeThreads = MyOptions.TreeThreads;
             int fileThreads = MyOptions.FileThreads;
 
-            ShareTaskScheduler = new BlockingStaticTaskScheduler(shareThreads, MyOptions.MaxShareQueue);
-            TreeTaskScheduler = new BlockingStaticTaskScheduler(treeThreads, MyOptions.MaxTreeQueue);
-            FileTaskScheduler = new BlockingStaticTaskScheduler(fileThreads, MyOptions.MaxFileQueue);
-
+            ShareTaskScheduler = new ShareTaskScheduler(shareThreads, MyOptions.MaxShareQueue);
+            TreeTaskScheduler = new TreeTaskScheduler(treeThreads, MyOptions.MaxTreeQueue);
+            FileTaskScheduler = new FileTaskScheduler(fileThreads, MyOptions.MaxFileQueue);
+            
             FileScanner = new FileScanner();
             TreeWalker = new TreeWalker();
             ShareFinder = new ShareFinder();
@@ -68,15 +70,15 @@ namespace SnaffCore
         {
             return FileScanner;
         }
-        public static BlockingStaticTaskScheduler GetShareTaskScheduler()
+        public static ShareTaskScheduler GetShareTaskScheduler()
         {
             return ShareTaskScheduler;
         }
-        public static BlockingStaticTaskScheduler GetTreeTaskScheduler()
+        public static TreeTaskScheduler GetTreeTaskScheduler()
         {
             return TreeTaskScheduler;
         }
-        public static BlockingStaticTaskScheduler GetFileTaskScheduler()
+        public static FileTaskScheduler GetFileTaskScheduler()
         {
             return FileTaskScheduler;
         }
@@ -99,10 +101,54 @@ namespace SnaffCore
             statusUpdateTimer.Elapsed += TimedStatusUpdate;
             statusUpdateTimer.Start();
 
+            if (MyOptions.TaskFile != null && MyOptions.TaskFile.Length > 0)
+            {
+                ResumingTaskScheduler.SetTaskFile(MyOptions.TaskFile);
+            }
+
+            if (MyOptions.ResumeFrom != null && MyOptions.ResumeFrom.Length > 0)
+            {
+                // Parse task file into structured data
+                TaskFileEntry[] taskFileEntries = File.ReadAllLines(MyOptions.ResumeFrom).Select(line => new TaskFileEntry(line)).ToArray();
+
+                // Set the internal list on the scheduler so it can skip tasks (adds pending too because those will be handled below)
+                ResumingTaskScheduler.SetAlreadyHandledTasks(taskFileEntries);
+
+                // Parse the completed and pending tasks for dispatching
+                TaskFileEntry[] completedTasks = taskFileEntries.Where(entry => entry.status == TaskFileEntryStatus.Completed).ToArray();
+                
+                // If the user has specified a new file to save to, append completed tasks for continuity
+                foreach (TaskFileEntry completedTask in completedTasks)
+                {
+                    ResumingTaskScheduler.CompleteTask(completedTask);
+                }
+
+                TaskFileEntry[] pendingTasks = taskFileEntries.Where(entry => (entry.status == TaskFileEntryStatus.Pending && !completedTasks.Any(completedEntry => completedEntry.guid == entry.guid))).ToArray();
+
+                // Dispatch pending tasks
+                foreach (TaskFileEntry pendingFileTask in pendingTasks)
+                {
+                    switch (pendingFileTask.type)
+                    {
+                        case TaskFileType.Share:
+                            ShareFinder shareFinder = new ShareFinder();
+                            ShareTaskScheduler.New(shareFinder.GetComputerShares, pendingFileTask.input, true);
+                            break;
+                        case TaskFileType.Tree:
+                            TreeTaskScheduler.New(TreeWalker.WalkTree, pendingFileTask.input, true);
+                            break;
+                        case TaskFileType.File:
+                            FileTaskScheduler.New(FileScanner.ScanFile, pendingFileTask.input, true);
+                            break;
+                    }
+                }
+            }
+
+            // Continue with normal operation, anything handled from the file above will be skipped internally by the scheduler
 
             // If we want to hunt for user IDs, we need data from the running user's domain.
             // Future - walk trusts
-            if ( MyOptions.DomainUserRules)
+            if (MyOptions.DomainUserRules)
             {
                 DomainUserDiscovery();
             }
@@ -158,8 +204,10 @@ namespace SnaffCore
             }
 
             waitHandle.WaitOne();
+            ResumingTaskScheduler.CloseTaskFile();
 
             StatusUpdate();
+
             DateTime finished = DateTime.Now;
             TimeSpan runSpan = finished.Subtract(StartTime);
             Mq.Info("Finished at " + finished.ToLocalTime());
@@ -329,20 +377,9 @@ namespace SnaffCore
                     computerName = computer;
                 }
                 // ShareFinder Task Creation - this kicks off the rest of the flow
-                Mq.Trace("Creating a ShareFinder task for " + computerName);
-                ShareTaskScheduler.New(() =>
-                {
-                    try
-                    {
-                        ShareFinder shareFinder = new ShareFinder();
-                        shareFinder.GetComputerShares(computerName);
-                    }
-                    catch (Exception e)
-                    {
-                        Mq.Error("Exception in ShareFinder task for host " + computerName);
-                        Mq.Error(e.ToString());
-                    }
-                });
+                Mq.Trace("Creating a ShareFinder task for " + computer);
+                ShareFinder shareFinder = new ShareFinder();
+                ShareTaskScheduler.New(shareFinder.GetComputerShares, computer);
             }
             Mq.Info("Created all sharefinder tasks.");
         }
@@ -404,18 +441,7 @@ namespace SnaffCore
             {
                 // TreeWalker Task Creation - this kicks off the rest of the flow
                 Mq.Info("Creating a TreeWalker task for " + pathTarget);
-                TreeTaskScheduler.New(() =>
-                {
-                    try
-                    {
-                        TreeWalker.WalkTree(pathTarget);
-                    }
-                    catch (Exception e)
-                    {
-                        Mq.Error("Exception in TreeWalker task for path " + pathTarget);
-                        Mq.Error(e.ToString());
-                    }
-                });
+                TreeTaskScheduler.New(TreeWalker.WalkTree, pathTarget);
             }
 
             Mq.Info("Created all TreeWalker tasks.");

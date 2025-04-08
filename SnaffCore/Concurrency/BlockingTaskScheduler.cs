@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -34,6 +37,8 @@ namespace SnaffCore.Concurrency
             // single get, it's locked inside the method
             Scheduler.RecalculateCounters();
             TaskCounters taskCounters = Scheduler.GetTaskCounters();
+
+            Console.WriteLine($"Checking if done - queued: {taskCounters.CurrentTasksQueued}, done: {taskCounters.CurrentTasksRunning}");
 
             if ((taskCounters.CurrentTasksQueued + taskCounters.CurrentTasksRunning == 0))
             {
@@ -85,6 +90,410 @@ namespace SnaffCore.Concurrency
                     _taskFactory.StartNew(actionWithImpersonation, _cancellationSource.Token);
                 }
             }
+        }
+    }
+
+    public enum TaskFileType
+    {
+        None = 0,
+        Share = 1,
+        Tree = 2,
+        File = 3
+    }
+    
+    public enum TaskFileEntryStatus
+    {
+        Pending = 0,
+        Completed = 1,
+    }
+
+    public struct TaskFileEntry
+    {
+        public TaskFileEntryStatus status;
+        public string guid;
+        public TaskFileType type;
+        public string input;
+
+        public override string ToString()
+        {
+            StringBuilder stringBuilder = new StringBuilder();
+
+            stringBuilder.Append(status.ToString());
+            stringBuilder.Append("|");
+            stringBuilder.Append(guid);
+            stringBuilder.Append("|");
+            stringBuilder.Append(type.ToString());
+            stringBuilder.Append("|");
+            stringBuilder.Append(input);
+
+            return stringBuilder.ToString();
+        }
+
+        public TaskFileEntry(TaskFileType type, string input)
+        {
+            guid = Guid.NewGuid().ToString();
+            status = TaskFileEntryStatus.Pending;
+            this.type = type;
+            this.input = input;
+        }
+
+        public TaskFileEntry(string entryLine)
+        {
+            string[] lineParts = entryLine.Split('|');
+
+            status = (TaskFileEntryStatus)Enum.Parse(typeof(TaskFileEntryStatus), lineParts[0]);
+            guid = lineParts[1];
+
+            type = (TaskFileType)Enum.Parse(typeof(TaskFileType), lineParts[2]);
+            input = lineParts[3];
+        }
+    }
+
+    public class ResumingTaskScheduler : BlockingStaticTaskScheduler
+    {
+        private static readonly object WriteLock = new object();
+        private static StreamWriter fileWriter;
+
+        private static string[] AlreadyHandledTasks;
+
+        internal BlockingMq Mq { get; }
+
+        public ResumingTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog)
+        {
+            this.Mq = BlockingMq.GetMq();
+        }
+
+        public static void SetAlreadyHandledTasks(TaskFileEntry[] taskFileEntries)
+        {
+            AlreadyHandledTasks = taskFileEntries.Select(entry => entry.input).Distinct().ToArray();
+        }
+
+        public static bool IsTaskAlreadyHandled(string input)
+        {
+            if (AlreadyHandledTasks == null) return false;
+            return AlreadyHandledTasks.Contains(input);
+        }
+
+        public void New(TaskFileType taskType, Action<string> action, string input)
+        {
+            New(taskType, action, input, false);
+        }
+
+        public void New(TaskFileType taskType, Action<string> action, string input, bool ignoreAlreadyHandled)
+        {
+            if (!ignoreAlreadyHandled && IsTaskAlreadyHandled(input)) return;
+
+            TaskFileEntry? taskFileEntry = SaveTask(taskType, input);
+
+            New(() =>
+            {
+                try
+                {
+                    action(input);
+                }
+                catch (Exception e)
+                {
+                    Mq.Error("Exception in " + taskType.ToString() + " task for host " + input);
+                    Mq.Error(e.ToString());
+                }
+
+                CompleteTask(taskFileEntry);
+            });
+        }
+
+        public static void SetTaskFile(string path)
+        {
+            fileWriter = new StreamWriter(path);
+        }
+
+        public static void CloseTaskFile()
+        {
+            if (fileWriter != null) {
+                lock (WriteLock)
+                {
+                    fileWriter.Close();
+                    fileWriter = null;
+                }
+            }
+        }
+
+        internal TaskFileEntry? SaveTask(TaskFileType taskType, string input)
+        {
+            // task file is not set, we are not saving tasks
+            if (fileWriter == null) return null;
+
+            TaskFileEntry taskFileEntry = new TaskFileEntry(taskType, input);
+
+            lock (WriteLock)
+            {
+                fileWriter.WriteLine(taskFileEntry.ToString());
+                fileWriter.Flush();
+            }
+
+            return taskFileEntry;
+        }
+
+        public static void CompleteTask(TaskFileEntry? taskFileEntry)
+        {
+            if (fileWriter == null) return;
+            if (!taskFileEntry.HasValue) return;
+
+            TaskFileEntry taskFileEntryValue = taskFileEntry.Value;
+
+            taskFileEntryValue.status = TaskFileEntryStatus.Completed;
+
+            lock (WriteLock)
+            {
+                fileWriter.WriteLine(taskFileEntryValue.ToString());
+                fileWriter.Flush();
+            }
+        }
+    }
+
+    public class ShareTaskScheduler : ResumingTaskScheduler
+    {
+        public ShareTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog) { }
+
+        public void New(Action<string> action, string share)
+        {
+            New(action, share, false);
+        }
+
+        public void New(Action<string> action, string share, bool ignoreAlreadyHandled)
+        {
+            New(TaskFileType.Share, action, share, ignoreAlreadyHandled);
+        }
+    }
+
+    public class TreeTaskScheduler : ResumingTaskScheduler
+    {
+        public TreeTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog) { }
+
+        public void New(Action<string> action, string tree)
+        {
+            New(action, tree, false);
+        }
+
+        public void New(Action<string> action, string tree, bool ignoreAlreadyHandled)
+        {
+            New(TaskFileType.Tree, action, tree, ignoreAlreadyHandled);
+        }
+    }
+
+    public class FileTaskScheduler : ResumingTaskScheduler
+    {
+        public FileTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog) { }
+
+        public void New(Action<string> action, string tree)
+        {
+            New(action, tree, false);
+        }
+
+        public void New(Action<string> action, string file, bool ignoreAlreadyHandled)
+        {
+            New(TaskFileType.File, action, file, ignoreAlreadyHandled);
+        }
+    }
+
+    public enum TaskFileType
+    {
+        None = 0,
+        Share = 1,
+        Tree = 2,
+        File = 3
+    }
+    
+    public enum TaskFileEntryStatus
+    {
+        Pending = 0,
+        Completed = 1,
+    }
+
+    public struct TaskFileEntry
+    {
+        public TaskFileEntryStatus status;
+        public string guid;
+        public TaskFileType type;
+        public string input;
+
+        public override string ToString()
+        {
+            StringBuilder stringBuilder = new StringBuilder();
+
+            stringBuilder.Append(status.ToString());
+            stringBuilder.Append("|");
+            stringBuilder.Append(guid);
+            stringBuilder.Append("|");
+            stringBuilder.Append(type.ToString());
+            stringBuilder.Append("|");
+            stringBuilder.Append(input);
+
+            return stringBuilder.ToString();
+        }
+
+        public TaskFileEntry(TaskFileType type, string input)
+        {
+            guid = Guid.NewGuid().ToString();
+            status = TaskFileEntryStatus.Pending;
+            this.type = type;
+            this.input = input;
+        }
+
+        public TaskFileEntry(string entryLine)
+        {
+            string[] lineParts = entryLine.Split('|');
+
+            status = (TaskFileEntryStatus)Enum.Parse(typeof(TaskFileEntryStatus), lineParts[0]);
+            guid = lineParts[1];
+
+            type = (TaskFileType)Enum.Parse(typeof(TaskFileType), lineParts[2]);
+            input = lineParts[3];
+        }
+    }
+
+    public class ResumingTaskScheduler : BlockingStaticTaskScheduler
+    {
+        private static readonly object WriteLock = new object();
+        private static StreamWriter fileWriter;
+
+        private static string[] AlreadyHandledTasks;
+
+        internal BlockingMq Mq { get; }
+
+        public ResumingTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog)
+        {
+            this.Mq = BlockingMq.GetMq();
+        }
+
+        public static void SetAlreadyHandledTasks(TaskFileEntry[] taskFileEntries)
+        {
+            AlreadyHandledTasks = taskFileEntries.Select(entry => entry.input).Distinct().ToArray();
+        }
+
+        public static bool IsTaskAlreadyHandled(string input)
+        {
+            if (AlreadyHandledTasks == null) return false;
+            return AlreadyHandledTasks.Contains(input);
+        }
+
+        public void New(TaskFileType taskType, Action<string> action, string input)
+        {
+            New(taskType, action, input, false);
+        }
+
+        public void New(TaskFileType taskType, Action<string> action, string input, bool ignoreAlreadyHandled)
+        {
+            if (!ignoreAlreadyHandled && IsTaskAlreadyHandled(input)) return;
+
+            TaskFileEntry? taskFileEntry = SaveTask(taskType, input);
+
+            New(() =>
+            {
+                try
+                {
+                    action(input);
+                }
+                catch (Exception e)
+                {
+                    Mq.Error("Exception in " + taskType.ToString() + " task for host " + input);
+                    Mq.Error(e.ToString());
+                }
+
+                CompleteTask(taskFileEntry);
+            });
+        }
+
+        public static void SetTaskFile(string path)
+        {
+            fileWriter = new StreamWriter(path);
+        }
+
+        public static void CloseTaskFile()
+        {
+            if (fileWriter != null) {
+                lock (WriteLock)
+                {
+                    fileWriter.Close();
+                    fileWriter = null;
+                }
+            }
+        }
+
+        internal TaskFileEntry? SaveTask(TaskFileType taskType, string input)
+        {
+            // task file is not set, we are not saving tasks
+            if (fileWriter == null) return null;
+
+            TaskFileEntry taskFileEntry = new TaskFileEntry(taskType, input);
+
+            lock (WriteLock)
+            {
+                fileWriter.WriteLine(taskFileEntry.ToString());
+                fileWriter.Flush();
+            }
+
+            return taskFileEntry;
+        }
+
+        public static void CompleteTask(TaskFileEntry? taskFileEntry)
+        {
+            if (fileWriter == null) return;
+            if (!taskFileEntry.HasValue) return;
+
+            TaskFileEntry taskFileEntryValue = taskFileEntry.Value;
+
+            taskFileEntryValue.status = TaskFileEntryStatus.Completed;
+
+            lock (WriteLock)
+            {
+                fileWriter.WriteLine(taskFileEntryValue.ToString());
+                fileWriter.Flush();
+            }
+        }
+    }
+
+    public class ShareTaskScheduler : ResumingTaskScheduler
+    {
+        public ShareTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog) { }
+
+        public void New(Action<string> action, string share)
+        {
+            New(action, share, false);
+        }
+
+        public void New(Action<string> action, string share, bool ignoreAlreadyHandled)
+        {
+            New(TaskFileType.Share, action, share, ignoreAlreadyHandled);
+        }
+    }
+
+    public class TreeTaskScheduler : ResumingTaskScheduler
+    {
+        public TreeTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog) { }
+
+        public void New(Action<string> action, string tree)
+        {
+            New(action, tree, false);
+        }
+
+        public void New(Action<string> action, string tree, bool ignoreAlreadyHandled)
+        {
+            New(TaskFileType.Tree, action, tree, ignoreAlreadyHandled);
+        }
+    }
+
+    public class FileTaskScheduler : ResumingTaskScheduler
+    {
+        public FileTaskScheduler(int threads, int maxBacklog) : base(threads, maxBacklog) { }
+
+        public void New(Action<string> action, string tree)
+        {
+            New(action, tree, false);
+        }
+
+        public void New(Action<string> action, string file, bool ignoreAlreadyHandled)
+        {
+            New(TaskFileType.File, action, file, ignoreAlreadyHandled);
         }
     }
 
